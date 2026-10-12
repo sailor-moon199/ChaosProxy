@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse
 
 from proxy.config import load_config
 from proxy.faults import FaultRules, fault_rules
+from proxy.health import health_check_loop, record_backend_failure
 from proxy.router import BackendPool
 from proxy.server import DropConnectionResponse
 
@@ -24,6 +25,7 @@ HTTP_METHODS = [
     "TRACE",
     "CONNECT",
 ]
+IDEMPOTENT_METHODS = {"GET", "HEAD", "PUT", "DELETE"}
 HOP_BY_HOP_HEADERS = {
     b"connection",
     b"keep-alive",
@@ -57,9 +59,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     fault_rules.latency_ms = config.faults.latency_ms
     fault_rules.error_rate = config.faults.error_rate
     fault_rules.drop_rate = config.faults.drop_rate
+    app.state.health_check_task = asyncio.create_task(
+        health_check_loop(app.state.http_client, app.state.backend_pool.backends),
+        name="backend-health-checker",
+    )
     try:
         yield
     finally:
+        app.state.health_check_task.cancel()
+        try:
+            await app.state.health_check_task
+        except asyncio.CancelledError:
+            pass
         await app.state.http_client.aclose()
 
 
@@ -87,8 +98,20 @@ async def update_control(rules: FaultRulesUpdate) -> FaultRules:
     return fault_rules
 
 
+@app.get("/status")
+async def get_status(request: Request) -> dict[str, list[dict[str, object]]]:
+    return {"backends": request.app.state.backend_pool.get_status()}
+
+
 @app.api_route("/{path:path}", methods=HTTP_METHODS)
 async def proxy_request(path: str, request: Request) -> Response:
+    backend_pool: BackendPool = request.app.state.backend_pool
+    if not backend_pool.has_healthy_backends():
+        return JSONResponse(
+            status_code=503,
+            content={"error": "no healthy backends"},
+        )
+
     if random.random() < fault_rules.drop_rate:
         return DropConnectionResponse(request.client)
     if random.random() < fault_rules.error_rate:
@@ -137,7 +160,12 @@ async def proxy_request(path: str, request: Request) -> Response:
     request_body = b"".join(body_chunks)
 
     client: httpx.AsyncClient = request.app.state.http_client
-    backend_url = request.app.state.backend_pool.next_backend()
+    backend_url = backend_pool.next_backend()
+    if backend_url is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "no healthy backends"},
+        )
     request_headers = request.headers.raw
     excluded_request_headers = _connection_headers(request_headers) | {
         b"host",
@@ -152,23 +180,55 @@ async def proxy_request(path: str, request: Request) -> Response:
     target_url = httpx.URL(f"{backend_url}/{path}").copy_with(
         query=request.url.query.encode("ascii")
     )
-    try:
-        backend_response = await client.request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=request_body,
-        )
-    except httpx.TimeoutException:
-        return JSONResponse(
-            status_code=504,
-            content={"detail": "Backend request timed out"},
-        )
-    except httpx.RequestError:
-        return JSONResponse(
-            status_code=502,
-            content={"detail": "Backend request failed"},
-        )
+    retried = False
+    while True:
+        try:
+            backend_response = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=request_body,
+            )
+            break
+        except httpx.TransportError as error:
+            failed_backend = backend_pool.get_backend_state(backend_url)
+            if failed_backend is not None:
+                record_backend_failure(failed_backend)
+
+            if not retried and request.method in IDEMPOTENT_METHODS:
+                retry_backend_url = backend_pool.next_backend(
+                    exclude_url=backend_url
+                )
+                if retry_backend_url is not None:
+                    backend_url = retry_backend_url
+                    target_url = httpx.URL(f"{backend_url}/{path}").copy_with(
+                        query=request.url.query.encode("ascii")
+                    )
+                    retried = True
+                    continue
+
+            status_code = 504 if isinstance(error, httpx.TimeoutException) else 502
+            detail = (
+                "Backend request timed out"
+                if status_code == 504
+                else "Backend request failed"
+            )
+            response_headers = {"X-Retried": "true"} if retried else None
+            return JSONResponse(
+                status_code=status_code,
+                content={"detail": detail},
+                headers=response_headers,
+            )
+        except httpx.RequestError:
+            failed_backend = backend_pool.get_backend_state(backend_url)
+            if failed_backend is not None:
+                record_backend_failure(failed_backend)
+            response_headers = {"X-Retried": "true"} if retried else None
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Backend request failed"},
+                headers=response_headers,
+            )
 
     response = Response(
         content=backend_response.content,
@@ -187,4 +247,6 @@ async def proxy_request(path: str, request: Request) -> Response:
         if name.lower() == b"content-length"
     ]
     response.headers["X-Served-By"] = backend_url
+    if retried:
+        response.headers["X-Retried"] = "true"
     return response
