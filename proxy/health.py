@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from proxy.metrics import set_backend_health
 from proxy.router import BackendState
 
 logger = logging.getLogger("uvicorn.error")
@@ -23,6 +24,7 @@ def record_backend_failure(
         and backend.consecutive_failures >= UNHEALTHY_FAILURE_THRESHOLD
     ):
         backend.healthy = False
+        set_backend_health(backend.url, False)
         logger.warning(
             "%s HEALTHY -> UNHEALTHY at %s",
             backend.url,
@@ -45,6 +47,7 @@ def record_backend_success(
     backend.consecutive_failures = 0
     if not backend.healthy:
         backend.healthy = True
+        set_backend_health(backend.url, True)
         logger.info(
             "%s UNHEALTHY -> HEALTHY at %s",
             backend.url,

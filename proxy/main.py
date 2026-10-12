@@ -1,16 +1,25 @@
 import asyncio
 import random
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import JSONResponse
 
 from proxy.config import load_config
-from proxy.faults import FaultRules, fault_rules
+from proxy.faults import FaultRules, fault_rules, record_fault_injected
 from proxy.health import health_check_loop, record_backend_failure
+from proxy.metrics import (
+    REQUESTS_TOTAL,
+    REQUEST_LATENCY_SECONDS,
+    RETRIES_TOTAL,
+    render_metrics,
+    update_backend_health,
+)
 from proxy.router import BackendPool
 from proxy.server import DropConnectionResponse
 
@@ -26,6 +35,7 @@ HTTP_METHODS = [
     "CONNECT",
 ]
 IDEMPOTENT_METHODS = {"GET", "HEAD", "PUT", "DELETE"}
+MANAGEMENT_PATHS = {"/metrics", "/status", "/control"}
 HOP_BY_HOP_HEADERS = {
     b"connection",
     b"keep-alive",
@@ -56,6 +66,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.config = config
     app.state.http_client = httpx.AsyncClient()
     app.state.backend_pool = BackendPool(config.backends)
+    update_backend_health(app.state.backend_pool.backends)
     fault_rules.latency_ms = config.faults.latency_ms
     fault_rules.error_rate = config.faults.error_rate
     fault_rules.drop_rate = config.faults.drop_rate
@@ -75,6 +86,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def record_request_metrics(
+    request: Request,
+    call_next: RequestResponseEndpoint,
+) -> Response:
+    if request.url.path in MANAGEMENT_PATHS:
+        return await call_next(request)
+
+    started_at = time.perf_counter()
+    backend = "none"
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        backend = getattr(
+            request.state,
+            "metrics_backend",
+            response.headers.get("X-Served-By", "none"),
+        )
+        return response
+    finally:
+        backend = getattr(request.state, "metrics_backend", backend)
+        REQUESTS_TOTAL.labels(
+            backend=backend,
+            status_code=str(status_code),
+        ).inc()
+        REQUEST_LATENCY_SECONDS.labels(backend=backend).observe(
+            time.perf_counter() - started_at
+        )
 
 
 class FaultRulesUpdate(BaseModel):
@@ -103,6 +145,13 @@ async def get_status(request: Request) -> dict[str, list[dict[str, object]]]:
     return {"backends": request.app.state.backend_pool.get_status()}
 
 
+@app.get("/metrics", include_in_schema=False)
+async def get_metrics(request: Request) -> Response:
+    update_backend_health(request.app.state.backend_pool.backends)
+    metrics, content_type = render_metrics()
+    return Response(content=metrics, media_type=content_type)
+
+
 @app.api_route("/{path:path}", methods=HTTP_METHODS)
 async def proxy_request(path: str, request: Request) -> Response:
     backend_pool: BackendPool = request.app.state.backend_pool
@@ -113,13 +162,16 @@ async def proxy_request(path: str, request: Request) -> Response:
         )
 
     if random.random() < fault_rules.drop_rate:
+        record_fault_injected("drop")
         return DropConnectionResponse(request.client)
     if random.random() < fault_rules.error_rate:
+        record_fault_injected("error")
         return JSONResponse(
             status_code=503,
             content={"detail": "Injected error"},
         )
     if fault_rules.latency_ms > 0:
+        record_fault_injected("latency")
         await asyncio.sleep(fault_rules.latency_ms / 1000)
 
     max_body_bytes: int = request.app.state.config.max_body_bytes
@@ -166,6 +218,7 @@ async def proxy_request(path: str, request: Request) -> Response:
             status_code=503,
             content={"error": "no healthy backends"},
         )
+    request.state.metrics_backend = backend_url
     request_headers = request.headers.raw
     excluded_request_headers = _connection_headers(request_headers) | {
         b"host",
@@ -201,6 +254,8 @@ async def proxy_request(path: str, request: Request) -> Response:
                 )
                 if retry_backend_url is not None:
                     backend_url = retry_backend_url
+                    request.state.metrics_backend = backend_url
+                    RETRIES_TOTAL.inc()
                     target_url = httpx.URL(f"{backend_url}/{path}").copy_with(
                         query=request.url.query.encode("ascii")
                     )

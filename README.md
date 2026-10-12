@@ -20,6 +20,14 @@ check time. Backend URLs must be unique. An unexpected error checking one
 backend is logged without stopping checks for the others, and a health result
 that began before a newer passive failure cannot erase that failure.
 
+Prometheus metrics are exposed at `GET /metrics` in the standard text
+exposition format. The endpoint reports proxy request totals and latency,
+backend health, injected fault counts, and passive retries. `/metrics`,
+`/status`, and `/control` requests are excluded from request and latency
+metrics. Labels use backend URLs and status codes or fault types; request paths
+are never metric labels. Backend health metrics are initialized at startup and
+updated when a backend changes health state.
+
 For `GET`, `HEAD`, `PUT`, and `DELETE`, a connection-level upstream failure or
 timeout is counted against that backend and retried once on another healthy
 backend. Requests are never retried after receiving an HTTP response, and

@@ -1,4 +1,7 @@
 from dataclasses import dataclass
+from typing import Literal
+
+from proxy.metrics import FAULTS_INJECTED_TOTAL
 
 
 @dataclass
@@ -9,3 +12,7 @@ class FaultRules:
 
 
 fault_rules = FaultRules()
+
+
+def record_fault_injected(fault_type: Literal["latency", "error", "drop"]) -> None:
+    FAULTS_INJECTED_TOTAL.labels(type=fault_type).inc()
