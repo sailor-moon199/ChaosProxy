@@ -18,6 +18,7 @@ from proxy.metrics import (
     REQUEST_LATENCY_SECONDS,
     RETRIES_TOTAL,
     render_metrics,
+    update_backend_circuit_states,
     update_backend_health,
 )
 from proxy.router import BackendPool
@@ -65,8 +66,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config = load_config()
     app.state.config = config
     app.state.http_client = httpx.AsyncClient()
-    app.state.backend_pool = BackendPool(config.backends)
+    app.state.backend_pool = BackendPool(
+        config.backends,
+        failure_threshold=config.circuit_breaker.failure_threshold,
+        cooldown_seconds=config.circuit_breaker.cooldown_seconds,
+    )
     update_backend_health(app.state.backend_pool.backends)
+    update_backend_circuit_states(app.state.backend_pool.backends)
     fault_rules.latency_ms = config.faults.latency_ms
     fault_rules.error_rate = config.faults.error_rate
     fault_rules.drop_rate = config.faults.drop_rate
@@ -142,12 +148,16 @@ async def update_control(rules: FaultRulesUpdate) -> FaultRules:
 
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, list[dict[str, object]]]:
-    return {"backends": request.app.state.backend_pool.get_status()}
+    backend_pool = request.app.state.backend_pool
+    statuses = backend_pool.get_status()
+    update_backend_circuit_states(backend_pool.backends)
+    return {"backends": statuses}
 
 
 @app.get("/metrics", include_in_schema=False)
 async def get_metrics(request: Request) -> Response:
     update_backend_health(request.app.state.backend_pool.backends)
+    update_backend_circuit_states(request.app.state.backend_pool.backends)
     metrics, content_type = render_metrics()
     return Response(content=metrics, media_type=content_type)
 
@@ -216,8 +226,9 @@ async def proxy_request(path: str, request: Request) -> Response:
     if backend_url is None:
         return JSONResponse(
             status_code=503,
-            content={"error": "no healthy backends"},
+            content={"error": "no available backends"},
         )
+    half_open_probe = backend_pool.is_half_open_probe(backend_url)
     request.state.metrics_backend = backend_url
     request_headers = request.headers.raw
     excluded_request_headers = _connection_headers(request_headers) | {
@@ -243,10 +254,19 @@ async def proxy_request(path: str, request: Request) -> Response:
                 content=request_body,
             )
             break
+        except asyncio.CancelledError:
+            if half_open_probe:
+                backend_pool.abandon_half_open_probe(backend_url)
+            raise
         except httpx.TransportError as error:
             failed_backend = backend_pool.get_backend_state(backend_url)
             if failed_backend is not None:
                 record_backend_failure(failed_backend)
+            backend_pool.record_request_result(
+                backend_url,
+                succeeded=False,
+                half_open_probe=half_open_probe,
+            )
 
             if not retried and request.method in IDEMPOTENT_METHODS:
                 retry_backend_url = backend_pool.next_backend(
@@ -254,6 +274,7 @@ async def proxy_request(path: str, request: Request) -> Response:
                 )
                 if retry_backend_url is not None:
                     backend_url = retry_backend_url
+                    half_open_probe = backend_pool.is_half_open_probe(backend_url)
                     request.state.metrics_backend = backend_url
                     RETRIES_TOTAL.inc()
                     target_url = httpx.URL(f"{backend_url}/{path}").copy_with(
@@ -278,6 +299,11 @@ async def proxy_request(path: str, request: Request) -> Response:
             failed_backend = backend_pool.get_backend_state(backend_url)
             if failed_backend is not None:
                 record_backend_failure(failed_backend)
+            backend_pool.record_request_result(
+                backend_url,
+                succeeded=False,
+                half_open_probe=half_open_probe,
+            )
             response_headers = {"X-Retried": "true"} if retried else None
             return JSONResponse(
                 status_code=502,
@@ -285,6 +311,11 @@ async def proxy_request(path: str, request: Request) -> Response:
                 headers=response_headers,
             )
 
+    backend_pool.record_request_result(
+        backend_url,
+        succeeded=backend_response.status_code < 500,
+        half_open_probe=half_open_probe,
+    )
     response = Response(
         content=backend_response.content,
         status_code=backend_response.status_code,

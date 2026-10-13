@@ -60,6 +60,13 @@ st.markdown(
         gap: 0.5rem;
         margin-bottom: 1rem;
     }
+    .backend-status-pills {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+    }
     .backend-dot {
         width: 0.65rem;
         height: 0.65rem;
@@ -81,6 +88,32 @@ st.markdown(
         font-size: 0.7rem;
         font-weight: 700;
         letter-spacing: 0.04em;
+    }
+    .circuit-state {
+        display: inline-block;
+        border: 1px solid;
+        border-radius: 999px;
+        padding: 0.2rem 0.55rem;
+        font-size: 0.7rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+    }
+    .circuit-details {
+        margin-top: 0.65rem;
+        color: #9da7b3;
+        font-size: 0.76rem;
+    }
+    .circuit-closed {
+        color: #42d392;
+        border-color: rgba(66, 211, 146, 0.38);
+    }
+    .circuit-half-open {
+        color: #f2cc60;
+        border-color: rgba(242, 204, 96, 0.45);
+    }
+    .circuit-open {
+        color: #ff6b75;
+        border-color: rgba(255, 107, 117, 0.38);
     }
     .backend-url {
         overflow-wrap: anywhere;
@@ -280,15 +313,37 @@ def _render_backend_card(backend: dict[str, Any] | None) -> None:
     dot_class = "dot-healthy" if healthy else "dot-unhealthy"
     url = html.escape(str(backend["url"]))
     failures = int(backend["consecutive_failures"])
+    circuit_state = str(backend.get("circuit_state", "CLOSED"))
+    circuit_label = {
+        "CLOSED": "Circuit CLOSED",
+        "HALF_OPEN": "Circuit HALF-OPEN",
+        "OPEN": "Circuit OPEN",
+    }.get(circuit_state, "Circuit UNKNOWN")
+    circuit_class = {
+        "CLOSED": "circuit-closed",
+        "HALF_OPEN": "circuit-half-open",
+        "OPEN": "circuit-open",
+    }.get(circuit_state, "circuit-open")
+    circuit_failures = int(backend.get("circuit_failures", 0))
+    retry_after = float(backend.get("circuit_retry_after_seconds", 0))
+    circuit_detail = (
+        f" · retry in {retry_after:.1f}s" if circuit_state == "OPEN" else ""
+    )
     st.markdown(
         f"""
         <div class="backend-card">
             <div class="backend-card-top">
                 <span class="backend-dot {dot_class}"></span>
-                <span class="backend-state {state_class}">{state}</span>
+                <div class="backend-status-pills">
+                    <span class="backend-state {state_class}">{state}</span>
+                    <span class="circuit-state {circuit_class}">{circuit_label}</span>
+                </div>
             </div>
             <div class="backend-url">{url}</div>
             <div class="backend-failures">Consecutive failures: {failures}</div>
+            <div class="circuit-details">
+                Circuit failures: {circuit_failures}{circuit_detail}
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -406,10 +461,11 @@ def render_dashboard() -> None:
     with gateway_column:
         pill_class = "gateway-online" if gateway_online else "gateway-offline"
         gateway_state = "ONLINE" if gateway_online else "OFFLINE"
+        gateway_dot_class = "dot-healthy" if gateway_online else "dot-unhealthy"
         st.markdown(
             f'<div style="text-align:right;padding-top:0.8rem">'
             f'<span class="gateway-pill {pill_class}">'
-            f'<span class="backend-dot {"dot-healthy" if gateway_online else "dot-unhealthy"}"></span>'
+            f'<span class="backend-dot {gateway_dot_class}"></span>'
             f'Gateway {gateway_state}</span></div>',
             unsafe_allow_html=True,
         )

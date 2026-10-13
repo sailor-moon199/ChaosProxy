@@ -42,6 +42,12 @@ RETRIES_TOTAL = Counter(
     "Total passive failover retries attempted.",
     registry=REGISTRY,
 )
+CIRCUIT_STATE = Gauge(
+    "chaosproxy_circuit_state",
+    "Backend circuit state: 0 closed, 1 half-open, and 2 open.",
+    ["backend"],
+    registry=REGISTRY,
+)
 
 
 def set_backend_health(backend_url: str, healthy: bool) -> None:
@@ -51,6 +57,16 @@ def set_backend_health(backend_url: str, healthy: bool) -> None:
 def update_backend_health(backends: Iterable[BackendState]) -> None:
     for backend in backends:
         set_backend_health(backend.url, backend.healthy)
+
+
+def update_backend_circuit_states(backends: Iterable[BackendState]) -> None:
+    for backend in backends:
+        circuit_state_value = {
+            "CLOSED": 0,
+            "HALF_OPEN": 1,
+            "OPEN": 2,
+        }[backend.circuit_state.value]
+        CIRCUIT_STATE.labels(backend=backend.url).set(circuit_state_value)
 
 
 def render_metrics() -> tuple[bytes, str]:

@@ -7,11 +7,13 @@ from proxy.faults import record_fault_injected
 from proxy.health import record_backend_failure, record_backend_success
 from proxy.main import MANAGEMENT_PATHS, record_request_metrics
 from proxy.metrics import (
+    CIRCUIT_STATE,
     FAULTS_INJECTED_TOTAL,
     REGISTRY,
+    update_backend_circuit_states,
     update_backend_health,
 )
-from proxy.router import BackendState
+from proxy.router import BackendState, CircuitState
 
 
 def _sample_value(name: str, labels: dict[str, str]) -> float:
@@ -131,3 +133,22 @@ class MetricsInstrumentationTests(unittest.IsolatedAsyncioTestCase):
             ),
             1.0,
         )
+
+    def test_circuit_state_gauge_maps_all_states(self) -> None:
+        backend = BackendState("http://circuit-metrics-test")
+        expected_values = {
+            CircuitState.CLOSED: 0.0,
+            CircuitState.HALF_OPEN: 1.0,
+            CircuitState.OPEN: 2.0,
+        }
+
+        for state, expected_value in expected_values.items():
+            backend.circuit_state = state
+            update_backend_circuit_states([backend])
+            self.assertEqual(
+                _sample_value(
+                    "chaosproxy_circuit_state",
+                    {"backend": backend.url},
+                ),
+                expected_value,
+            )

@@ -15,11 +15,18 @@ class ConfigError(ValueError):
 
 
 @dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int
+    cooldown_seconds: float
+
+
+@dataclass
 class ProxyConfig:
     backends: list[str]
     listen_port: int
     max_body_bytes: int
     faults: FaultRules
+    circuit_breaker: CircuitBreakerConfig
 
 
 def _require_mapping(value: object, section: str) -> dict[str, object]:
@@ -115,6 +122,37 @@ def _validate_fault_rules(value: object) -> FaultRules:
     )
 
 
+def _validate_circuit_breaker(value: object) -> CircuitBreakerConfig:
+    settings = _require_mapping(value, "circuit_breaker")
+    _require_exact_keys(
+        settings,
+        {"failure_threshold", "cooldown_seconds"},
+        "circuit_breaker",
+    )
+
+    threshold = settings["failure_threshold"]
+    if type(threshold) is not int or threshold < 1:
+        raise ConfigError(
+            "'circuit_breaker.failure_threshold' must be a positive integer."
+        )
+
+    cooldown = settings["cooldown_seconds"]
+    if (
+        isinstance(cooldown, bool)
+        or not isinstance(cooldown, (int, float))
+        or not math.isfinite(cooldown)
+        or cooldown <= 0
+    ):
+        raise ConfigError(
+            "'circuit_breaker.cooldown_seconds' must be a positive number."
+        )
+
+    return CircuitBreakerConfig(
+        failure_threshold=threshold,
+        cooldown_seconds=float(cooldown),
+    )
+
+
 def load_config(path: str | Path | None = None) -> ProxyConfig:
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     try:
@@ -136,7 +174,13 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
     config = _require_mapping(raw_config, "root")
     _require_exact_keys(
         config,
-        {"backends", "listen_port", "max_body_bytes", "faults"},
+        {
+            "backends",
+            "listen_port",
+            "max_body_bytes",
+            "faults",
+            "circuit_breaker",
+        },
         "root",
     )
     return ProxyConfig(
@@ -144,4 +188,5 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
         listen_port=_validate_port(config["listen_port"]),
         max_body_bytes=_validate_max_body_bytes(config["max_body_bytes"]),
         faults=_validate_fault_rules(config["faults"]),
+        circuit_breaker=_validate_circuit_breaker(config["circuit_breaker"]),
     )

@@ -10,3 +10,7 @@ faults:
   latency_ms: 500
   error_rate: 0.0
   drop_rate: 0.0
+
+circuit_breaker:
+  failure_threshold: 5
+  cooldown_seconds: 30
