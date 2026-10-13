@@ -20,6 +20,17 @@ check time. Backend URLs must be unique. An unexpected error checking one
 backend is logged without stopping checks for the others, and a health result
 that began before a newer passive failure cannot erase that failure.
 
+The Streamlit dashboard polls backend status, fault rules, and Prometheus
+metrics every two seconds. It shows gateway availability, backend health, and
+request/error rates over the last 60 seconds; mean request latency is charted
+when histogram data is available. Use the sidebar latency, error-rate, and
+drop-rate sliders with **Apply** to update `/control`, or **Reset** to set all
+rules to zero. Run it from the project root with:
+
+```powershell
+.\venv\Scripts\python.exe -m streamlit run dashboard\app.py
+```
+
 Prometheus metrics are exposed at `GET /metrics` in the standard text
 exposition format. The endpoint reports proxy request totals and latency,
 backend health, injected fault counts, and passive retries. `/metrics`,
